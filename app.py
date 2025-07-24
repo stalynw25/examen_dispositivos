@@ -51,6 +51,7 @@ def guardar_hash(file_hash: str):
     with open("hashes.txt", "a") as f:
         f.write(file_hash + "\n")
 
+
 def leer_pdf_bytes(content: bytes) -> str:
     # Extrae texto de un archivo PDF cargado en memoria (usa PyMuPDF)
     texto = ""
@@ -58,6 +59,12 @@ def leer_pdf_bytes(content: bytes) -> str:
         for page in doc:
             texto += page.get_text()
     return texto
+
+def leer_html_bytes(content: bytes) -> str:
+    # Extrae texto de un archivo HTML cargado en memoria
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(content, "html.parser")
+    return soup.get_text(separator="\n")
 
 def fragmentar(texto: str):
     # Divide el texto en fragmentos pequeños (chunks) para que puedan ser vectorizados
@@ -86,7 +93,7 @@ st.set_page_config(page_title="PDF Gemini QA", layout="centered")
 st.title("📄🔍 Pregunta a tu PDF con Gemini + Pinecone")
 
 # --- Subida de PDF (opcional) ---
-uploaded_file = st.file_uploader("Sube un archivo PDF (opcional)", type="pdf")
+uploaded_file = st.file_uploader("Sube un archivo PDF o HTML (opcional)", type=["pdf", "html"])
 if uploaded_file:
     content = uploaded_file.read()
     file_hash = hash_archivo(content)
@@ -94,14 +101,19 @@ if uploaded_file:
     if ya_existente(file_hash):
         st.info("✅ Este archivo ya fue vectorizado anteriormente.")
     else:
-        with st.spinner("📚 Procesando y vectorizando el PDF..."):
-            texto = leer_pdf_bytes(content)
+        with st.spinner("📚 Procesando y vectorizando el archivo..."):
+            if uploaded_file.type == "application/pdf":
+                texto = leer_pdf_bytes(content)
+            elif uploaded_file.type == "text/html":
+                texto = leer_html_bytes(content)
+            else:
+                texto = ""
             if texto.strip():
                 vectorizar_documento(texto)
                 guardar_hash(file_hash)
                 st.success("✅ Documento vectorizado y almacenado correctamente.")
             else:
-                st.error("⚠️ No se pudo extraer texto del PDF.")
+                st.error("⚠️ No se pudo extraer texto del archivo.")
 
 # --- Crear chain QA (sin estado) ---
 if "qa_chain" not in st.session_state:
