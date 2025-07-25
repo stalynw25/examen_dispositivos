@@ -2,14 +2,14 @@ import os  # Para manejo de variables de entorno
 import hashlib  # Para generar hash único del archivo PDF
 from pathlib import Path  # Para verificar si existen archivos locales (hashes.txt)
 import fitz  # Librería PyMuPDF: lectura y extracción de texto desde archivos PDF
-import streamlit as st  # Para crear la interfaz web interactiva
+from fastapi import FastAPI, UploadFile, File  # Para crear la API RESTful
 from dotenv import load_dotenv  # Para cargar las variables de entorno desde el archivo .env
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings  # Modelo Gemini y embeddings de Google
 from langchain.text_splitter import RecursiveCharacterTextSplitter  # Para dividir el texto del PDF en fragmentos pequeños
 from langchain_pinecone import PineconeVectorStore  # Conexión con el índice de vectores en Pinecone
 from langchain.chains import RetrievalQA  # Cadena para preguntas aisladas con recuperación de contexto
-from langchain.callbacks import get_openai_callback  # Para medir tokens utilizados (funciona con modelos compatibles)
+from langchain_community.callbacks.manager import get_openai_callback  # Para medir tokens utilizados (funciona con modelos compatibles)
 from pinecone import Pinecone, ServerlessSpec  # Cliente de Pinecone y configuración de región para índices vectoriales
 
 # === Configuración inicial ===
@@ -37,23 +37,18 @@ vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=embedding)
 
 # === Funciones utilitarias ===
 def hash_archivo(content: bytes) -> str:
-    # Genera un hash único (SHA-256) para identificar si un PDF ya fue procesado antes
     return hashlib.sha256(content).hexdigest()
 
 def ya_existente(file_hash: str) -> bool:
-    # Verifica si el hash del archivo ya fue guardado (ya fue vectorizado previamente)
     if not Path("hashes.txt").exists():
         return False
     return file_hash in Path("hashes.txt").read_text().splitlines()
 
 def guardar_hash(file_hash: str):
-    # Guarda el hash en un archivo local para evitar repetir el procesamiento
     with open("hashes.txt", "a") as f:
         f.write(file_hash + "\n")
 
-
 def leer_pdf_bytes(content: bytes) -> str:
-    # Extrae texto de un archivo PDF cargado en memoria (usa PyMuPDF)
     texto = ""
     with fitz.open(stream=content, filetype="pdf") as doc:
         for page in doc:
@@ -61,75 +56,92 @@ def leer_pdf_bytes(content: bytes) -> str:
     return texto
 
 def leer_html_bytes(content: bytes) -> str:
-    # Extrae texto de un archivo HTML cargado en memoria
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(content, "html.parser")
     return soup.get_text(separator="\n")
 
 def fragmentar(texto: str):
-    # Divide el texto en fragmentos pequeños (chunks) para que puedan ser vectorizados
-    splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=500)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=400)
     return splitter.create_documents([texto])
 
 def vectorizar_documento(texto: str):
-    # Vectoriza el texto fragmentado y lo almacena en Pinecone
     docs = fragmentar(texto)
     PineconeVectorStore.from_documents(docs, index_name=INDEX_NAME, embedding=embedding)
 
 def crear_chain_qa():
-    # Tipos de chain_type disponibles:
-    # - "stuff": (rápido, usa todo el contexto completo en una sola llamada, ideal para pocos documentos)
-    # - "map_reduce": (más lento, procesa por partes y resume, útil para muchos documentos o textos largos)
-    # - "refine": (más lento, mejora progresivamente una respuesta, útil si necesitas precisión)
-    # - "map_rerank": (mapea respuestas y selecciona la mejor, balance entre velocidad y relevancia)
     return RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=vectorstore.as_retriever()
     )
 
-# === Interfaz Streamlit ===
-st.set_page_config(page_title="PDF Gemini QA", layout="centered")
-st.title("📄🔍 Pregunta a tu PDF con Gemini + Pinecone")
+# === Función Código César +3 ===
+def caesar_cipher(text: str, shift: int = 3) -> str:
+    """Función para encriptar el texto con el código César +3."""
+    result = []
+    
+    # Itera por cada carácter del texto
+    for char in text:
+        # Para las letras mayúsculas
+        if char.isupper():
+            result.append(chr((ord(char) - 65 + shift) % 26 + 65))
+        # Para las letras minúsculas
+        elif char.islower():
+            result.append(chr((ord(char) - 97 + shift) % 26 + 97))
+        # Los caracteres no alfabéticos (como espacio, puntuación, números) no se modifican
+        else:
+            result.append(char)
+    
+    return ''.join(result)
 
-# --- Subida de PDF (opcional) ---
-uploaded_file = st.file_uploader("Sube un archivo PDF o HTML (opcional)", type=["pdf", "html"])
-if uploaded_file:
-    content = uploaded_file.read()
+# Inicializar FastAPI
+app = FastAPI()
+
+@app.post("/uploadfile/")
+async def upload_file(file: UploadFile = File(...)):
+    content = await file.read()
     file_hash = hash_archivo(content)
 
     if ya_existente(file_hash):
-        st.info("✅ Este archivo ya fue vectorizado anteriormente.")
+        return {"message": "Este archivo ya fue vectorizado anteriormente."}
     else:
-        with st.spinner("📚 Procesando y vectorizando el archivo..."):
-            if uploaded_file.type == "application/pdf":
-                texto = leer_pdf_bytes(content)
-            elif uploaded_file.type == "text/html":
-                texto = leer_html_bytes(content)
-            else:
-                texto = ""
-            if texto.strip():
-                vectorizar_documento(texto)
-                guardar_hash(file_hash)
-                st.success("✅ Documento vectorizado y almacenado correctamente.")
-            else:
-                st.error("⚠️ No se pudo extraer texto del archivo.")
+        if file.content_type == "application/pdf":
+            texto = leer_pdf_bytes(content)
+        elif file.content_type == "text/html":
+            texto = leer_html_bytes(content)
+        else:
+            return {"message": "Formato de archivo no soportado"}
 
-# --- Crear chain QA (sin estado) ---
-if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = crear_chain_qa()
+        if texto.strip():
+            vectorizar_documento(texto)
+            guardar_hash(file_hash)
+            return {"message": "Documento vectorizado y almacenado correctamente."}
+        else:
+            return {"message": "No se pudo extraer texto del archivo."}
 
-# --- Entrada de pregunta ---
-pregunta = st.text_input("📝 Escribe tu pregunta:")
-pregunta = pregunta + "/n Recuerda que debes responder en español."
+@app.get("/preguntar/")
+async def ask_question(question: str):
+    try:
+        # Verifica si la cadena de preguntas ya está en la sesión
+        if not hasattr(app.state, "qa_chain"):
+            app.state.qa_chain = crear_chain_qa()
 
-if st.button("💬 Preguntar") and pregunta.strip():
-    with st.spinner("🧠 Pensando..."):
-        try:
-            # Cada llamada es independiente, no hay historial guardado
-            with get_openai_callback() as cb:
-                respuesta = st.session_state.qa_chain.run(pregunta)
-                st.success(respuesta)
-                st.info(f"🔢 Tokens estimados utilizados: {cb.total_tokens}")
-        except Exception as e:
-            st.error(f"❌ Ocurrió un error: {e}")
+        # Imprime la pregunta que se está procesando
+        print(f"Recibiendo la pregunta: {question}")
+
+        # Realiza la consulta utilizando la cadena de preguntas
+        with get_openai_callback() as cb:
+            respuesta = app.state.qa_chain.run(question)
+
+            # Encriptar la respuesta con el código César +3
+            respuesta_encriptada = caesar_cipher(respuesta, shift=3)
+
+            # Imprime la respuesta generada para ver el resultado en la consola del backend
+            print(f"Respuesta generada (encriptada): {respuesta_encriptada}")
+
+            # Retorna la respuesta encriptada y los tokens usados
+            return {"respuesta": respuesta_encriptada, "tokens_usados": cb.total_tokens}
+    
+    except Exception as e:
+        print(f"Error en la generación de respuesta: {str(e)}")  # Esto te ayudará a detectar el error
+        return {"error": str(e)}
